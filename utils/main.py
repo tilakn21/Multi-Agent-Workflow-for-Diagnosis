@@ -381,5 +381,3 @@ async def compose_case(payload: ComposeJSON):
         
     print(json.dumps(final_diagnosis, indent=2))
     return {"final_diagnosis": final_diagnosis}
-
-
