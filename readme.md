@@ -38,7 +38,7 @@ MediMind uses a **team of specialized agents**:
    - Provides retrieval and similarity-based recommendations for new queries.  
 
 3. **Literature Agent:**  
-   - Implements a **Graph RAG** using **FAISS** with **980,440 vectors/nodes** from medical books and journals.  
+   - Implements a **Graph RAG** using **FAISS** with **301163 vectors and 679277 nodes** from medical books and journals.  
    - Fetches structured diagnosis suggestions based on query relevance.  
 
 4. **Scraping Agent:**  
