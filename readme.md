@@ -1,190 +1,223 @@
-{
- "cells": [
-  {
-   "cell_type": "markdown",
-   "id": "944e9a36",
-   "metadata": {},
-   "source": [
-    "# Documentation for the Multi-Agent Patient Diagnostics Workflow\n",
-    "\n",
-    "This document outlines the five core agents in a sequential, LangGraph-orchestrated patient diagnostics system: **Audio-to-Text Agent**, **Memory Agent**, **Literature Agent**, **Decision Agent**, and **Cross-Verifying (Verification) Agent**. The Web Scraping Agent, part of the architecture, is not implemented but would handle live web data. The system leverages **Redis** for transient data, **Postgres** for persistence, **Pinecone** for vector search, **LangChain** for LLM integration, and additional tools (FastAPI, Whisper, boto3) for robustness. Below, each agent’s role, inputs, process, outputs, and technologies are summarized.\n",
-    "\n",
-    "## 1. Audio-to-Text Agent\n",
-    "\n",
-    "**Role**: Captures and processes doctor-patient audio conversations to extract structured medical information, acting as the workflow’s entry point.\n",
-    "\n",
-    "**Inputs**: Audio file (.wav/.mp3) uploaded via FastAPI endpoint with patient ID.\n",
-    "\n",
-    "**Process**:\n",
-    "- Stores raw audio in S3/MinIO for traceability.\n",
-    "- Transcribes audio using OpenAI Whisper (base model for speed; large for accuracy).\n",
-    "- Extracts entities (demographics, symptoms with duration/severity, context like travel history, intent) using a LangChain LLM chain with a custom prompt and few-shot example.\n",
-    "- Normalizes symptoms with a dictionary mapper (e.g., \"high temperature\" → \"fever\" with SNOMED-CT code; expandable to quickumls).\n",
-    "- Validates output and adds timestamp and S3 storage reference.\n",
-    "\n",
-    "**Outputs**: JSON with:\n",
-    "- `patient_id`\n",
-    "- `demographics` (e.g., `{\"age\": 45, \"gender\": \"male\"}`)\n",
-    "- `symptoms` (e.g., `[{\"name\": \"fever\", \"duration\": \"2 weeks\", \"normalized_name\": \"fever\", \"snomed_code\": \"386661006\"}]`)\n",
-    "- `context` (e.g., `{\"travel_history\": \"Recent trip to India\"}`)\n",
-    "- `intent` (e.g., \"diagnosis\")\n",
-    "- `raw_transcript`\n",
-    "- `audio_storage` (S3 key)\n",
-    "- `timestamp`\n",
-    "Stored in Redis as `{patient_id}:audio_to_text`.\n",
-    "\n",
-    "**Technologies**:\n",
-    "- **FastAPI**: API endpoint for audio uploads.\n",
-    "- **OpenAI Whisper**: Speech-to-text transcription.\n",
-    "- **LangChain**: PromptTemplate, ChatOpenAI, LLMChain for entity extraction.\n",
-    "- **boto3**: S3/MinIO for audio storage.\n",
-    "- **Redis**: Output storage.\n",
-    "- **Logging**: Traceability.\n",
-    "- **LangGraph**: Node for workflow integration.\n",
-    "\n",
-    "## 2. Memory Agent\n",
-    "\n",
-    "**Role**: Serves as the \"clinical memory,\" storing new patient cases and retrieving similar past cases for diagnostic context.\n",
-    "\n",
-    "**Inputs**: Structured JSON from Audio-to-Text Agent (via Redis) containing patient_id, demographics, symptoms, context, intent.\n",
-    "\n",
-    "**Process**:\n",
-    "- Fetches input from Redis.\n",
-    "- Stores case in Postgres (`patient_cases` table with JSONB fields: demographics, symptoms, etc., using upsert for updates).\n",
-    "- Generates vector embedding of concatenated data (demographics + symptoms + context + intent) with OpenAIEmbeddings.\n",
-    "- Upserts embedding and metadata to Pinecone index (`patient-cases`).\n",
-    "- Retrieves top-5 similar cases via Pinecone cosine similarity search, excluding the current case.\n",
-    "- Handles errors with fallbacks and logging.\n",
-    "\n",
-    "**Outputs**: JSON with:\n",
-    "- `patient_id`\n",
-    "- `similar_cases` (list of `{\"similar_patient_id\", \"similarity_score\", \"metadata\"}`)\n",
-    "- `timestamp`\n",
-    "Stored in Redis as `{patient_id}:memory`.\n",
-    "\n",
-    "**Technologies**:\n",
-    "- **psycopg2**: Postgres storage.\n",
-    "- **Pinecone**: Vector database for case embeddings and similarity search.\n",
-    "- **OpenAIEmbeddings**: Embedding generation.\n",
-    "- **Redis**: Input/output storage.\n",
-    "- **Logging**: Error tracking.\n",
-    "- **LangGraph**: Node integration. Enhanced with self-exclusion in retrieval.\n",
-    "\n",
-    "## 3. Literature Agent\n",
-    "\n",
-    "**Role**: Retrieves and summarizes evidence from curated, static medical literature (e.g., guidelines, PubMed abstracts) to support diagnostics.\n",
-    "\n",
-    "**Inputs**: Patient query/transcript from Audio-to-Text and similar cases from Memory (via Redis), patient_id.\n",
-    "\n",
-    "**Process**:\n",
-    "- Fetches inputs from Redis.\n",
-    "- Generates query embedding (query + memory context) using OpenAIEmbeddings.\n",
-    "- Retrieves top-10 relevant chunks from Pinecone index (`medical-literature`).\n",
-    "- Optionally fetches full document for high-relevance chunks (>0.8 score) from S3.\n",
-    "- Summarizes chunks via LangChain LLM chain with a prompt focused on findings, guidelines, and citations.\n",
-    "- Validates and enhances output with relevance scores.\n",
-    "\n",
-    "**Outputs**: JSON with:\n",
-    "- `patient_id`\n",
-    "- `evidence` (list of `{\"snippet\", \"source\", \"relevance_score\", \"citation\"}`)\n",
-    "- `summary` (concise evidence summary)\n",
-    "- `timestamp`\n",
-    "Stored in Redis as `{patient_id}:literature`.\n",
-    "\n",
-    "**Technologies**:\n",
-    "- **Pinecone**: Vector search for literature chunks.\n",
-    "- **OpenAIEmbeddings**: Query/chunk embedding.\n",
-    "- **LangChain**: PromptTemplate, ChatOpenAI, LLMChain for summarization.\n",
-    "- **boto3**: S3 for full documents.\n",
-    "- **psycopg2**: Document metadata storage (ingestion).\n",
-    "- **Redis**: Input/output storage.\n",
-    "- **Logging**: Traceability.\n",
-    "- **LangGraph**: Node integration. Added ingestion function for new documents (chunking, upsert to Pinecone/Postgres/S3).\n",
-    "\n",
-    "## 4. Decision Agent\n",
-    "\n",
-    "**Role**: Synthesizes inputs from upstream agents to produce differential diagnoses, recommended tests, treatments, and explanations.\n",
-    "\n",
-    "**Inputs**: Patient query from Audio-to-Text, similar cases from Memory, literature from Literature Agent, scraped data from Web Scraping (placeholder), patient_id (via Redis).\n",
-    "\n",
-    "**Process**:\n",
-    "- Fetches and validates inputs from Redis (query required; fallbacks for others).\n",
-    "- Runs LangChain LLM chain with a prompt enforcing JSON schema, few-shot example, and missing-data handling.\n",
-    "- Parses and validates output, enhances with timestamp, model version, formatted explanation, and PubMed URLs.\n",
-    "- Stores in Postgres (`decisions` table) and Redis for Verification Agent.\n",
-    "\n",
-    "**Outputs**: JSON with:\n",
-    "- `patient_id`\n",
-    "- `differential_diagnoses` (e.g., `[{\"condition\": \"TB\", \"confidence\": 0.82}]`)\n",
-    "- `recommended_tests`\n",
-    "- `suggested_treatment`\n",
-    "- `explanation`\n",
-    "- `evidence_sources`\n",
-    "- `risk_assessment` (e.g., `{\"severity\": \"high\", \"urgency\": \"immediate\"}`)\n",
-    "- `alternative_explanations`\n",
-    "- `confidence_method`\n",
-    "- `formatted_explanation`\n",
-    "- `decision_timestamp`\n",
-    "- `model_version`\n",
-    "Stored in Redis as `{patient_id}:decision`.\n",
-    "\n",
-    "**Technologies**:\n",
-    "- **LangChain**: PromptTemplate, ChatOpenAI, LLMChain for synthesis.\n",
-    "- **psycopg2**: Postgres storage.\n",
-    "- **Redis**: Input/output storage.\n",
-    "- **Logging**: Error tracking.\n",
-    "- **LangGraph**: Node integration. Enhanced with schema validation and Markdown formatting.\n",
-    "\n",
-    "## 5. Cross-Verifying (Verification) Agent\n",
-    "\n",
-    "**Role**: Acts as a final quality gate, verifying the Decision Agent’s output against all upstream data for consistency, accuracy, and completeness.\n",
-    "\n",
-    "**Inputs**: Query from Audio-to-Text, similar cases from Memory, literature from Literature Agent, scraped data (placeholder), Decision output (from Redis or Postgres fallback), patient_id.\n",
-    "\n",
-    "**Process**:\n",
-    "- Fetches and validates inputs from Redis/Postgres (decision and query required).\n",
-    "- Runs LangChain LLM chain with a verification prompt to cross-check diagnoses, flag inconsistencies, and adjust confidences.\n",
-    "- Parses, validates schema, and enhances with timestamp, model version, formatted explanation.\n",
-    "- Stores in Postgres (`verifications` table).\n",
-    "\n",
-    "**Outputs**: JSON with:\n",
-    "- `patient_id`\n",
-    "- `verified_diagnoses` (list with adjusted confidences)\n",
-    "- `verified_tests`\n",
-    "- `verified_treatment`\n",
-    "- `verification_explanation`\n",
-    "- `inconsistencies` (list of issues, e.g., \"Literature contradicts TB diagnosis\")\n",
-    "- `final_risk_assessment`\n",
-    "- `corrections` (suggested fixes)\n",
-    "- `verified` (bool)\n",
-    "- `confidence_method`\n",
-    "- `formatted_verification_explanation`\n",
-    "- `verification_timestamp`\n",
-    "- `model_version`\n",
-    "Stored in Postgres.\n",
-    "\n",
-    "**Technologies**:\n",
-    "- **LangChain**: PromptTemplate, ChatOpenAI, LLMChain for verification.\n",
-    "- **psycopg2**: Postgres storage.\n",
-    "- **Redis**: Input storage.\n",
-    "- **Logging**: Traceability.\n",
-    "- **LangGraph**: Node integration. Enhanced with Postgres fallback and verified flag.\n",
-    "\n",
-    "**Note**: The system assumes a Postgres schema with tables `patient_cases`, `literature_docs`, `decisions`, and `verifications`. Redis keys follow `{patient_id}:{agent}` pattern. The Web Scraping Agent, if implemented, would fetch live data and store in Redis as `{patient_id}:web_scraping` for Decision/Verification Agents."
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "id": "0a399cbb",
-   "metadata": {},
-   "source": []
-  }
- ],
- "metadata": {
-  "language_info": {
-   "name": "python"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 5
-}
+# <img width="122" height="84" alt="Screenshot 2025-09-21 131905" src="https://github.com/user-attachments/assets/51852fea-c620-46f6-a937-7273882a6c1c" />
+
+
+**MediMind** is an AI-powered multi-agent clinical reasoning assistant that supports doctors in delivering fast, accurate, and guideline-compliant diagnoses. It is **not a replacement for doctors** but a workflow enhancer that reduces cognitive load, references historical cases, literature, and research, and generates structured patient reports and prescriptions.
+
+---
+
+## 🌐 Live Demo & Repository
+
+- **🚀 Web Application:** [Live Demo](https://medbott.vercel.app/)
+
+
+---
+
+## 🏥 Problem Statement
+
+Misdiagnosis and delayed treatment are significant challenges in healthcare, especially in India. Studies show that **up to 30% of medical errors in rural areas** result from incomplete patient history, scattered information, or lack of reference to medical literature. Doctors often struggle to integrate patient conversations, vitals, medical records, and research into a structured diagnosis efficiently.
+
+**Impact:**  
+- Increased medical errors  
+- Wasted resources due to repeated tests  
+- Delayed or improper treatment  
+- Increased burden on healthcare providers
+
+**Our solution:** MediMind – a multi-agent AI system that assists doctors by providing structured, evidence-backed diagnosis within seconds.
+
+---
+
+## 💡 Solution Overview
+
+MediMind uses a **team of specialized agents**:
+
+1. **Conversation Agent:**  
+   Captures the patient-doctor conversation, medical history, vitals, doctor's opinion, and optional medical records (like X-rays) into a structured query.
+
+2. **Memory Agent:**  
+   - Maintains a **vector database** of **350+ past cases** (queries + diagnoses) embedded using ClinicalBERT.  
+   - Provides retrieval and similarity-based recommendations for new queries.  
+
+3. **Literature Agent:**  
+   - Implements a **Graph RAG** using **FAISS** with **980,440 vectors/nodes** from medical books and journals.  
+   - Fetches structured diagnosis suggestions based on query relevance.  
+
+4. **Scraping Agent:**  
+   - Scrapes PubMed and WHO platforms for relevant articles and possible diagnoses.  
+
+5. **Decision Agent:**  
+   - Applies **ABHA guidelines** to ensure compliance.  
+   - Verifies **patient data privacy** and ranks candidate diagnoses.  
+
+6. **Final Response:**  
+   - Doctors receive the best-ranked diagnosis in under **10 seconds** from patient conversation to final output.  
+   - Generates a **prescription/report format** for both patient and doctor.  
+   - Doctor feedback is stored to improve future recommendations.
+
+---
+
+## ⚙️ Architecture
+
+![MediMind Architecture](https://github.com/user-attachments/assets/b0def1a2-7d26-4355-b850-c1c3962c21f8)
+
+**Flow of Information:**  
+1. Patient interaction → Conversation Agent  
+2. Query processing → Memory, Literature, Scraping Agents  
+3. LLM combines responses → Decision Agent  
+4. Final diagnosis → Doctor → Feedback stored in memory  
+5. Prescription/report generated → Patient and Doctor
+
+---
+
+## 🖥️ User Interface
+
+**Doctor Dashboard:** View patient info, generated diagnosis, add prescriptions or lab tests.  
+**Patient Interface:** Register ABHA ID, input vitals and medical history, view generated reports.
+
+<div align="center">
+  
+<img src="https://github.com/user-attachments/assets/0b147cdb-6cd1-4bf0-ac94-352dbbda93c7" width="400"/>
+<img src="https://github.com/user-attachments/assets/36d68ccd-43f3-43ad-ac92-8d9b5c1011d4" width="400"/>
+<img src="https://github.com/user-attachments/assets/a1e143dd-91f8-4895-b805-d82576ed8b27" width="400"/>
+<img src="https://github.com/user-attachments/assets/d007e1c7-2548-46bd-a015-cce47f02ce86" width="400"/>
+
+
+<img src="https://github.com/user-attachments/assets/77bcd212-0433-446f-8e71-e866e8250269" width="400"/>
+
+</div>
+
+<div align="center">
+<img src="https://github.com/user-attachments/assets/c5c44ae5-b157-42bf-8c54-cf3f27d2c691" width="400"/>
+</div>
+---
+
+## 🚀 Features
+
+- **Multi-agent AI workflow** for comprehensive diagnosis support
+- **Fast response time** (<10s from query to diagnosis)
+- **Historical case referencing** using vector database with 350+ cases
+- **Literature-backed diagnosis** with Graph RAG implementation
+- **Real-time web scraping** for latest research and guidelines
+- **ABHA-compliant** and privacy-safe healthcare data handling
+- **Structured reports** and prescription generation
+- **User-friendly interfaces** for both patients and doctors
+- **Continuous learning** from doctor feedback
+
+---
+
+## 🛠️ Tech Stack
+
+**Backend:**
+- FastAPI, Python
+- FAISS Vector Database
+- ClinicalBERT Embedding Model
+
+**Frontend:**
+- Next.js (Web + Mobile)
+- Responsive design for cross-platform compatibility
+
+**Data Sources:**
+- PubMed medical research
+- WHO guidelines and protocols
+- Medical books & journals
+- Historical case database
+
+**Infrastructure:**
+- Supabase (Authentication & Storage)
+- RESTful API architecture
+- Modular agent communication
+
+---
+
+## 📊 Performance Metrics
+
+- **Response Time:** <10 seconds end-to-end
+- **Case Database:** 350+ historical cases
+- **Literature Vectors:** 980,440 medical document nodes
+- **Accuracy:** Evidence-backed with multiple validation layers
+- **Compliance:** ABHA guidelines integrated
+
+---
+
+## 🏗️ Installation & Setup
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/tilakn21/Multi-Agent-Workflow-for-Diagnosis.git
+   cd Multi-Agent-Workflow-for-Diagnosis
+   ```
+
+2. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. **Environment setup:**
+   ```bash
+   cp .env.example .env
+   # Add your Supabase and other API keys to .env
+   ```
+
+4. **Run the application:**
+   ```bash
+   uvicorn main:app --reload
+   ```
+
+---
+
+## 📈 Why No Orchestration?
+
+- Agents communicate **modularly and sequentially**, avoiding heavy orchestration frameworks
+- This ensures **lightweight deployment, maintainability**, and **faster iteration**
+- Suitable for hackathon environments and MVP scenarios
+- Simplified debugging and monitoring of individual agent performance
+
+---
+
+## 🔮 Future Enhancements
+
+- Integration with hospital management systems
+- Multi-language support for regional healthcare
+- Advanced medical imaging analysis
+- Real-time vitals monitoring integration
+- Telemedicine consultation features
+
+---
+
+## 🤝 Contributing
+
+We welcome contributions! Please read our [Contributing Guidelines](CONTRIBUTING.md) for details on how to submit pull requests, report issues, and suggest improvements.
+
+---
+
+## 📚 References
+
+1. [Misdiagnosis in India: Causes and Impact](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6223504/)  
+2. [ABHA Guidelines](https://www.abdm.gov.in/)  
+3. [FAISS Documentation](https://faiss.ai/)  
+4. [ClinicalBERT](https://arxiv.org/abs/1904.03323)
+5. [Graph RAG Implementation](https://arxiv.org/abs/2404.16130)
+
+---
+
+## 💬 License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
+---
+
+## 👨‍💻 Author
+
+**Tilak Neema** - [GitHub](https://github.com/tilakn21)
+**Shubhang Chakrawarty** - [GitHub](https://github.com/shubhang69)
+**Abhinav Gupta** - [GitHub](https://github.com/Abhinav-gupta-123)
+**Aadish Sanghvi** - [GitHub](https://github.com/aadish-sanghvi)
+
+
+
+## 📌 Important Notes
+
+⚠️ **Disclaimer:** MediMind is a diagnostic assistance tool and should not replace professional medical judgment. Always consult with qualified healthcare professionals for medical decisions.
+
+🔒 **Privacy:** Ensure your `.env` file contains all required API keys securely. Never commit sensitive credentials to version control.
+
+🖼️ **Assets:** Replace placeholder URLs with your actual hosted frontend and demo links before deploying.
